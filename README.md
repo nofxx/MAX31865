@@ -26,9 +26,9 @@ Or install it yourself as:
 
     m = MAX31865.new(chip = 0, type = :k, clock = 2_000_000)
 
-    m.config # Must be run once (shutdown resets chip)
+    m.config # Run once (shutdown resets chip)
 
-    m.read   # [Cold Junction Temp, Thermocouple Temp] Floats in celsius
+    m.read   # RTD Temp (Float in celsius)
 
 
 ## Raspberry v3
@@ -60,6 +60,12 @@ and contributors are expected to adhere to the [Contributor Covenant](http://con
 
 The gem is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
 
-## Code of Conduct
+
+## Notes
+
+For Thermocouples, check out https://github.com/nofxx/MAX31856
+
+Thanks to https://github.com/hackenbergstefan/MAX31865
+
 
 Everyone interacting in the MAX31865 project’s codebases and issue trackers is expected to follow the [code of conduct](https://github.com/nofxx/max31865/blob/master/CODE_OF_CONDUCT.md).
