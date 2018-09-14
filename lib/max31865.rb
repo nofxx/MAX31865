@@ -4,71 +4,19 @@ require 'pi_piper'
 #
 # MAX31865
 #
+# Thanks to https://github.com/steve71/MAX31865/blob/master/max31865.py
 class MAX31865
-  attr_accessor :chip, :type, :clock
-
-  # Thermocouple Temperature Data Resolution
-  TC_RES = 0.0078125
-  # Cold-Junction Temperature Data Resolution
-  CJ_RES = 0.015625
+  attr_accessor :chip, :clock, :wires, :hz
 
   # Read registers
-  REG_CJ    = 0x08 # Cold Junction status register
-  REG_TC    = 0x0c # Thermocouple status register
-  REG_FAULT = 0x0F # Fault status register
-
-  #
-  # Config Register 1
-  # ------------------
-  # bit 7: Conversion Mode                         -> 1 (Normally Off Mode)
-  # bit 6: 1-shot                                  -> 0 (off)
-  # bit 5: open-circuit fault detection            -> 0 (off)
-  # bit 4: open-circuit fault detection type k     -> 1 (on)
-  # bit 3: Cold-junction sensor disabled           -> 0 (default)
-  # bit 2: Fault Mode                              -> 0 (default)
-  # bit 1: fault status clear                      -> 1 (clear any fault)
-  # bit 0: 50/60 Hz filter select                  -> 0 (60Hz)
-  #
-  REG_1 = [0x00, 0b10010010].freeze
-
-  #
-  # Config Register 2
-  # ------------------
-  # bit 7: Reserved                                -> 0
-  # bit 6: Averaging Mode 1 Sample                 -> 0 (default)
-  # bit 5: Averaging Mode 1 Sample                 -> 0 (default)
-  # bit 4: Averaging Mode 1 Sample                 -> 0 (default)
-  # bit 3: Thermocouple Type -> K Type (default)   -> 0 (default)
-  # bit 2: Thermocouple Type -> K Type (default)   -> 0 (default)
-  # bit 1: Thermocouple Type -> K Type (default)   -> 1 (default)
-  # bit 0: Thermocouple Type -> K Type (default)   -> 1 (default)
-  #
-  REG_2 = 0x01
-
-  #
-  # Config Register 2
-  # ------------------
-  # bit 7: Nil
-  # bit 6: Nil
-  # bit 5: Cold-Junction High Fault Threshold              -> 0 (default)
-  # bit 4: Cold-Junction Low Fault Threshold               -> 0 (default)
-  # bit 3: Thermocouple Temperature High Fault Threshold   -> 0 (default)
-  # bit 2: Thermocouple Temperature Low Fault Threshold    -> 0 (default)
-  # bit 1: Over-voltage or Undervoltage Input Fault        -> 1 (default)
-  # bit 0: Thermocouple Open-Circuit Fault                 -> 1 (default)
-  #
-  REG_3 = [0x02, 0b11111100].freeze
-
-  TYPES = {
-    b: 0x00,
-    e: 0x01,
-    j: 0x02,
-    k: 0x03,
-    n: 0x04,
-    r: 0x05,
-    s: 0x06,
-    t: 0x07
-  }.freeze
+  READ_REG = [0, 8].freeze
+  R_REF = 430.0 # Reference Resistor
+  R0    = 100.0 # Resistance at 0 degC for 400ohm R_Ref
+  A = 0.00390830
+  B = -0.000000577500
+  # C = -4.18301e-12 # for -200 <= T <= 0 (degC)
+  C = -0.00000000000418301
+  # C = 0 # for 0 <= T <= 850 (degC)
 
   CHIPS = {
     0 => PiPiper::Spi::CHIP_SELECT_0,
@@ -78,18 +26,13 @@ class MAX31865
   }.freeze
 
   FAULTS = {
-    0x80 => 'Cold Junction Out-of-Range',
-    0x40 => 'Thermocouple Out-of-Range',
-    0x20 => 'Cold-Junction High Fault',
-    0x10 => 'Cold-Junction Low Fault',
-    0x08 => 'Thermocouple Temperature High Fault',
-    0x04 => 'Thermocouple Temperature Low Fault',
-    0x02 => 'Overvoltage or Undervoltage Input Fault',
-    0x01 => 'Thermocouple Open-Circuit Fault'
+    0x80 => 'High threshold limit (Cable fault/open)',
+    0x40 => 'Low threshold limit (Cable fault/short)',
+    0x04 => 'Overvoltage or Undervoltage Error',
+    0x01 => 'RTD Open-Circuit Fault'
   }.freeze
 
-  def initialize(type = :k, chip = 0, clock = 2_000_000)
-    @type = TYPES[type]
+  def initialize(chip = 0, clock = 2_000_000)
     @chip = CHIPS[chip]
     @clock = clock
   end
@@ -97,7 +40,7 @@ class MAX31865
   def spi_work
     PiPiper::Spi.begin do |spi|
       # Set cpol, cpha
-      PiPiper::Spi.set_mode(0, 1)
+      PiPiper::Spi.set_mode(1, 1)
 
       # Setup the chip select behavior
       spi.chip_select_active_low(true)
@@ -117,81 +60,101 @@ class MAX31865
   #
   # Run once config
   #
-  # CR1_AVERAGE_1_SAMPLE                    0x00
-  # CR1_AVERAGE_2_SAMPLES                   0x10
-  # CR1_AVERAGE_4_SAMPLES                   0x20
-  # CR1_AVERAGE_8_SAMPLES                   0x30
-  # CR1_AVERAGE_16_SAMPLES                  0x40
-  #
-  # define CR1_VOLTAGE_MODE_GAIN_8                 0x08
-  # define CR1_VOLTAGE_MODE_GAIN_32                0x0C
   #
   # Optionally set samples
-  def config(samples = 0x10)
+  #
+  # 0x8x to specify 'write register value'
+  # 0xx0 to specify 'configuration register'
+  #
+  #
+  # Config Register
+  # ---------------
+  # bit 7  : Vbias -> 1 (ON)
+  # bit 6  : Conversion Mode -> 0 (MANUAL)
+  # bit 5  : 1-shot ->1 (ON)
+  # bit 4  : 3-wire select -> 1 (3 wire config)
+  # bit 3-2: fault detection cycle -> 0 (none)
+  # bit 1  : fault status clear -> 1 (clear any fault)
+  # bit 0  : 50/60 Hz filter select -> 0 (60Hz)
+  #
+  # 0b11010010 or 0xD2 for continuous auto conversion
+  # at 60Hz (faster conversion)
+  # 0b10110010 = 0xB2
+  def config(byte = 0xB2)
     spi_work do |spi|
-      spi.write(write_reg(REG_1))
-      spi.write(write_reg([REG_2, (samples | type)]))
-      spi.write(write_reg(REG_3))
+      spi.write(0x80, byte)
     end
     sleep 0.2 # give it 200ms for conversion
   end
 
-  # Set 0x80 on first for writes
-  def write_reg(ary)
-    ary[1..-1].unshift(ary[0] | 0x80)
-  end
-
   #
-  # Read both
+  # Read temperature!
   #
   def read
-    tc = cj = 0
     spi_work do |spi|
-      cj = read_cj(spi.write(Array.new(4, 0xff).unshift(REG_CJ)))
-      sleep 0.2
-      tc = read_tc(spi.write(Array.new(4, 0xff).unshift(REG_TC)))
+      read_temp(spi.write(Array.new(8, 0x01)))
     end
-    [tc, cj]
+  end
+
+  private
+
+  #
+  # Callendar-Van Dusen equation
+  # Res_RTD = Res0 * (1 + a*T + b*T**2 + c*(T-100)*T**3)
+  # Res_RTD = Res0 + a*Res0*T + b*Res0*T**2 # c = 0
+  # (c*Res0)T**4 - (c*Res0)*100*T**3
+  # + (b*Res0)*T**2 + (a*Res0)*T + (Res0 - Res_RTD) = 0
+  #
+  # quadratic formula:
+  # for 0 <= T <= 850 (degC)
+  #
+  def callendar_van_dusen(rtd)
+    temp = -(A * R0) +
+           Math.sqrt(A * A * R0 * R0 - 4 * (B * R0) * (R0 - rtd))
+    temp /= (2 * (B * R0))
+    # temp_line = (rtd_adc_code / 32.0) - 256.0
+    # puts "Straight Line Approx. Temp: #{temp_line}C"
+    # removing numpy.roots will greatly speed things up
+    # temp_C_numpy = numpy.roots([c*R0, -c*R0*100, b*R0, a*R0, (R0 - rtd)])
+    # temp_C_numpy = abs(temp_C_numpy[-1])
+    # print "Solving Full Callendar-Van Dusen using numpy: %f" %  temp_C_numpy
+    # use straight line approximation if less than 0
+    # Can also use python lib numpy to solve cubic
+    temp < 0 ? (rtd_adc_code / 32) - 256 : temp
   end
 
   #
-  # Read cold-junction
+  # Read temperature
   #
-  def read_cj(raw)
-    lb, mb, _offset = raw.reverse # Offset already on sum
-    # MSB << 8 | LSB and remove last 2
-    temp = ((mb << 8) | lb) >> 2
+  def read_temp(raw)
+    read_fault(raw[7])
+    rtd_msb, rtd_lsb = raw[1], raw[2]
+    rtd_adc_code = ((rtd_msb << 8) | rtd_lsb) >> 1
 
-    # Handle negative
-    temp -= 0x4000 unless (mb & 0x80).zero?
-
-    # Convert to Celsius
-    temp * CJ_RES
+    puts "RTD ADC Code: #{rtd_adc_code}"
+    rtd = (rtd_adc_code * R_REF) / 32_768.0 # PT100 Resistance
+    temp = callendar_van_dusen(rtd)
+    puts "PT100 Resistance: #{rtd} ohms"
+    puts "Callendar-Van Dusen Temp (degC > 0): #{temp}C"
   end
 
   #
-  # Read thermocouple
-  #
-  def read_tc(raw)
-    fault, lb, mb, hb = raw.reverse
-    FAULTS.each do |f, txt|
-      raise txt if fault & f == 1
-    end
-    # MSB << 8 | LSB and remove last 5
-    temp = ((hb << 16) | (mb << 8) | lb) >> 5
-
-    # Handle negative
-    temp -= 0x80000 unless (hb & 0x80).zero?
-
-    # Convert to Celsius
-    temp * TC_RES
-  end
-
   # Read register faults
-  def read_fault
-    spi_work do |spi|
-      fault = spi.write(REG_FAULT, 0xff)
-      p [fault, fault.last.to_s(2).rjust(8, '0')]
+  #
+  # 10 Mohm resistor is on breakout board to help detect cable faults
+  #
+  # bit 7: RTD High Threshold / cable fault open
+  # bit 6: RTD Low Threshold / cable fault short
+  # bit 5: REFIN- > 0.85 x VBias -> must be requested
+  # bit 4: REFIN- < 0.85 x VBias (FORCE- open) -> must be requested
+  # bit 3: RTDIN- < 0.85 x VBias (FORCE- open) -> must be requested
+  # bit 2: Overvoltage / undervoltage fault
+  # bits 1,0 don't care
+  # print "Status byte: #{status}"
+  #
+  def read_fault(byte)
+    FAULTS.each do |code, fault|
+      raise fault if byte & code == 1
     end
   end
 end
