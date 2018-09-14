@@ -6,11 +6,10 @@ require 'pi_piper'
 #
 # Thanks to https://github.com/steve71/MAX31865/blob/master/max31865.py
 class MAX31865
-  attr_accessor :chip, :clock, :wires, :hz
+  attr_accessor :chip, :clock, :ref, :wires, :hz
 
   # Read registers
   READ_REG = [0, 8].freeze
-  R_REF = 430.0 # Reference Resistor
   R0    = 100.0 # Resistance at 0 degC for 400ohm R_Ref
   A = 0.00390830
   B = -0.000000577500
@@ -32,8 +31,9 @@ class MAX31865
     0x01 => 'RTD Open-Circuit Fault'
   }.freeze
 
-  def initialize(chip = 0, clock = 2_000_000)
-    @chip = CHIPS[chip]
+  def initialize(chip: 0, ref: 430.0, clock: 2_000_000)
+    @chip  = CHIPS[chip]
+    @ref   = ref
     @clock = clock
   end
 
@@ -80,7 +80,7 @@ class MAX31865
   # 0b11010010 or 0xD2 for continuous auto conversion
   # at 60Hz (faster conversion)
   # 0b10110010 = 0xB2
-  def config(byte = 0xB2)
+  def config(byte = 0b11010010)
     spi_work do |spi|
       spi.write(0x80, byte)
     end
@@ -108,19 +108,18 @@ class MAX31865
   # quadratic formula:
   # for 0 <= T <= 850 (degC)
   #
-  def callendar_van_dusen(rtd)
+  def callendar_van_dusen(adc, rtd)
     temp = -(A * R0) +
            Math.sqrt(A * A * R0 * R0 - 4 * (B * R0) * (R0 - rtd))
     temp /= (2 * (B * R0))
-    # temp_line = (rtd_adc_code / 32.0) - 256.0
-    # puts "Straight Line Approx. Temp: #{temp_line}C"
     # removing numpy.roots will greatly speed things up
     # temp_C_numpy = numpy.roots([c*R0, -c*R0*100, b*R0, a*R0, (R0 - rtd)])
     # temp_C_numpy = abs(temp_C_numpy[-1])
     # print "Solving Full Callendar-Van Dusen using numpy: %f" %  temp_C_numpy
     # use straight line approximation if less than 0
     # Can also use python lib numpy to solve cubic
-    temp < 0 ? (rtd_adc_code / 32) - 256 : temp
+    # puts "Callendar-Van Dusen Temp (degC > 0): #{temp}C"
+    temp < 0 ? (adc / 32) - 256 : temp
   end
 
   #
@@ -129,13 +128,13 @@ class MAX31865
   def read_temp(raw)
     read_fault(raw[7])
     rtd_msb, rtd_lsb = raw[1], raw[2]
-    rtd_adc_code = ((rtd_msb << 8) | rtd_lsb) >> 1
-
-    puts "RTD ADC Code: #{rtd_adc_code}"
-    rtd = (rtd_adc_code * R_REF) / 32_768.0 # PT100 Resistance
-    temp = callendar_van_dusen(rtd)
-    puts "PT100 Resistance: #{rtd} ohms"
-    puts "Callendar-Van Dusen Temp (degC > 0): #{temp}C"
+    adc = ((rtd_msb << 8) | rtd_lsb) >> 1
+    puts "RTD ADC Code: #{adc}"
+    # temp_line = (adc / 32.0) - 256.0
+    # puts "Straight Line Approx. Temp: #{temp_line}C"
+    rtd = (adc * ref) / 32_768.0 # PT100 Resistance
+    # puts "PT100 Resistance: #{rtd} ohms"
+    callendar_van_dusen(adc, rtd)
   end
 
   #
