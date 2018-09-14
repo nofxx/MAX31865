@@ -24,7 +24,7 @@ Or install it yourself as:
 
 ## Usage
 
-    m = MAX31865.new(chip = 0, type = :k, clock = 2_000_000)
+    m = MAX31865.new(chip: 0, ref: 430.0, clock: 2_000_000)
 
     m.config # Run once (shutdown resets chip)
 
