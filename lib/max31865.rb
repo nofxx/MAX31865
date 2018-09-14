@@ -5,12 +5,14 @@ require 'pi_piper'
 # MAX31865
 #
 # Thanks to https://github.com/steve71/MAX31865/blob/master/max31865.py
+# https://github.com/hackenbergstefan/MAX31865/blob/master/max31865.py
 class MAX31865
-  attr_accessor :chip, :clock, :ref, :wires, :hz
+  attr_accessor :chip, :clock, :type, :ref, :wires, :hz
 
-  # Read registers
-  READ_REG = [0, 8].freeze
-  R0    = 100.0 # Resistance at 0 degC for 400ohm R_Ref
+  # Resistance at 0 degC for 400ohm R_Ref
+  R0 = 100.0
+
+  # Constants for Callendar-Van-Dusen equation
   A = 0.00390830
   B = -0.000000577500
   # C = -4.18301e-12 # for -200 <= T <= 0 (degC)
@@ -28,7 +30,7 @@ class MAX31865
     0x80 => 'High threshold limit (Cable fault/open)',
     0x40 => 'Low threshold limit (Cable fault/short)',
     0x04 => 'Overvoltage or Undervoltage Error',
-    0x01 => 'RTD Open-Circuit Fault'
+    0xff => 'Circuit Fault'
   }.freeze
 
   def initialize(chip: 0, ref: 430.0, clock: 2_000_000)
@@ -99,27 +101,39 @@ class MAX31865
   private
 
   #
-  # Callendar-Van Dusen equation
-  # Res_RTD = Res0 * (1 + a*T + b*T**2 + c*(T-100)*T**3)
-  # Res_RTD = Res0 + a*Res0*T + b*Res0*T**2 # c = 0
-  # (c*Res0)T**4 - (c*Res0)*100*T**3
-  # + (b*Res0)*T**2 + (a*Res0)*T + (Res0 - Res_RTD) = 0
+  # Callendar-Van Dusen equations
+  #
+  # Convert 0 <= raw_temp < 2^l5 to temperature in oC using quadratic polynom:
+  #
+  #  R(T)=R(0)(1+A*T+B*T^{2})
+  #
+  # => T = (-A*R(0) + sqrt(A^2 R(0)^2 - 4*B*R(0)*(R(0) - R(T)))) / (2*B*R(0))
   #
   # quadratic formula:
   # for 0 <= T <= 850 (degC)
   #
-  def callendar_van_dusen(adc, rtd)
-    temp = -(A * R0) +
-           Math.sqrt(A * A * R0 * R0 - 4 * (B * R0) * (R0 - rtd))
-    temp /= (2 * (B * R0))
-    # removing numpy.roots will greatly speed things up
-    # temp_C_numpy = numpy.roots([c*R0, -c*R0*100, b*R0, a*R0, (R0 - rtd)])
-    # temp_C_numpy = abs(temp_C_numpy[-1])
-    # print "Solving Full Callendar-Van Dusen using numpy: %f" %  temp_C_numpy
-    # use straight line approximation if less than 0
-    # Can also use python lib numpy to solve cubic
+  def quadratic(adc, rtd)
+    temp = -(A * R0)
+    temp += Math.sqrt(A * A * R0 * R0 - 4 * B * R0 * (R0 - rtd))
+    temp /= 2 * B * R0
     # puts "Callendar-Van Dusen Temp (degC > 0): #{temp}C"
     temp < 0 ? (adc / 32) - 256 : temp
+  end
+
+  # """
+  # Convert 0 <= raw_temp < 2^15 to temperature in oC using quartic polynom:
+  #
+  #  R(T) = R(0)[1+A*T+B*T^{2}+(T-100)C*T^{3}]
+  #
+  # => 0 = R(0)[1 + A*T + B*T^2 - 100*C*T^3 + C*T^4] - R(T)
+  #
+  # Solution is calculated numerically.
+  #
+  def quartic(rtd)
+    temp = rtd * R0 / (2**15 - 1)
+    roots = [C * R0, -100 * R0 * C, B * R0, A * R0, R0 - temp]
+            .map { |n| Math.sqrt(n) }
+    Math.abs(roots[-1])
   end
 
   #
@@ -129,12 +143,12 @@ class MAX31865
     read_fault(raw[7])
     rtd_msb, rtd_lsb = raw[1], raw[2]
     adc = ((rtd_msb << 8) | rtd_lsb) >> 1
-    puts "RTD ADC Code: #{adc}"
+    # puts "RTD ADC Code: #{adc}"
     # temp_line = (adc / 32.0) - 256.0
     # puts "Straight Line Approx. Temp: #{temp_line}C"
     rtd = (adc * ref) / 32_768.0 # PT100 Resistance
     # puts "PT100 Resistance: #{rtd} ohms"
-    callendar_van_dusen(adc, rtd)
+    quadratic(adc, rtd)
   end
 
   #
